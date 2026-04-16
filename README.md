@@ -20,7 +20,7 @@
 ## Demo Screenshots
 1. **Multi-container supervision:** [Completed] - Shows multiple `sleep` processes running under the supervisor.
 2. **Metadata tracking:** [Pending]
-3. **Bounded-buffer logging:** [Pending]
+3. **Bounded-buffer logging:** [Completed] - Evidence of container output captured into log files via the concurrent pipeline.
 4. **CLI and IPC:** [Completed] - Shows successful "start" commands issued via CLI to the supervisor daemon.
 5. **Soft-limit warning:** [Pending]
 6. **Hard-limit enforcement:** [Pending]
@@ -39,7 +39,10 @@
 - **Control Plane IPC:** A UNIX domain socket at `/tmp/mini_runtime.sock` allows the CLI client to send requests to the supervisor, enabling management of multiple concurrent container lifecycles.
 
 ### 3. IPC & Synchronization
-*(To be populated during Task 3)*
+- **Producer-Consumer Logging:** Implemented a thread-safe bounded buffer to decouple container output (producers) from file I/O (consumer).
+- **Race Condition Prevention:** Without synchronization, multiple producer threads could overwrite the same buffer index simultaneously, or the consumer could attempt to read stale data.
+- **Synchronization Choice:** - **`pthread_mutex_t`:** Used to ensure mutual exclusion when accessing shared buffer indices and the `count` variable.
+    - **`pthread_cond_t`:** Used `not_full` and `not_empty` signals to prevent busy-waiting. This avoids deadlocks by putting threads to sleep when the buffer is full (producers) or empty (consumer).
 
 ### 4. Memory Management (Kernel Module)
 ### 5. Scheduling Experiments
@@ -48,6 +51,9 @@
 - **Namespace Selection:** Chose `clone()` flags for isolation. 
     - **Tradeoff:** Increases complexity in stack management and process synchronization compared to simple `fork()`.
     - **Justification:** Essential for meeting the security and isolation requirements of a true container runtime.
+- **Bounded Buffer Capacity:** Set a fixed capacity of 16 items.
+    - **Tradeoff:** High-volume logging might block producers if the consumer is slow.
+    - **Justification:** Prevents the supervisor from consuming excessive memory under heavy load.
 
 ## Scheduler Experiment Results
 *(To be populated in final phase)*

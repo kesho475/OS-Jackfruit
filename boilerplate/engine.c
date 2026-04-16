@@ -289,9 +289,30 @@ static void bounded_buffer_begin_shutdown(bounded_buffer_t *buffer)
  */
 int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
 {
-    (void)buffer;
-    (void)item;
-    return -1;
+    /* Lock the buffer to prevent race conditions */
+    pthread_mutex_lock(&buffer->mutex);
+
+    /* Wait if the buffer is full, unless we are shutting down */
+    while (buffer->count == LOG_BUFFER_CAPACITY && !buffer->shutting_down) {
+        pthread_cond_wait(&buffer->not_full, &buffer->mutex);
+    }
+
+    /* If shutdown was triggered while waiting, bail out */
+    if (buffer->shutting_down) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return -1;
+    }
+
+    /* Insert the item at the tail and increment count */
+    buffer->items[buffer->tail] = *item;
+    buffer->tail = (buffer->tail + 1) % LOG_BUFFER_CAPACITY;
+    buffer->count++;
+
+    /* Signal the consumer thread that the buffer is no longer empty */
+    pthread_cond_signal(&buffer->not_empty);
+    pthread_mutex_unlock(&buffer->mutex);
+
+    return 0;
 }
 
 /*
@@ -305,9 +326,29 @@ int bounded_buffer_push(bounded_buffer_t *buffer, const log_item_t *item)
  */
 int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
 {
-    (void)buffer;
-    (void)item;
-    return -1;
+    pthread_mutex_lock(&buffer->mutex);
+
+    /* Wait if the buffer is empty, unless we are shutting down */
+    while (buffer->count == 0 && !buffer->shutting_down) {
+        pthread_cond_wait(&buffer->not_empty, &buffer->mutex);
+    }
+
+    /* If shutting down AND the buffer is fully drained, bail out safely */
+    if (buffer->count == 0 && buffer->shutting_down) {
+        pthread_mutex_unlock(&buffer->mutex);
+        return -1;
+    }
+
+    /* Extract the item from the head and decrement count */
+    *item = buffer->items[buffer->head];
+    buffer->head = (buffer->head + 1) % LOG_BUFFER_CAPACITY;
+    buffer->count--;
+
+    /* Signal the producer threads that the buffer is no longer full */
+    pthread_cond_signal(&buffer->not_full);
+    pthread_mutex_unlock(&buffer->mutex);
+
+    return 0;
 }
 
 /*
@@ -321,7 +362,25 @@ int bounded_buffer_pop(bounded_buffer_t *buffer, log_item_t *item)
  */
 void *logging_thread(void *arg)
 {
-    (void)arg;
+    supervisor_ctx_t *ctx = (supervisor_ctx_t *)arg;
+    log_item_t item;
+    
+    /* Ensure the logs directory exists */
+    mkdir(LOG_DIR, 0755);
+
+    /* Continuously pop items until shutdown is triggered and buffer is empty */
+    while (bounded_buffer_pop(&ctx->log_buffer, &item) == 0) {
+        char filepath[PATH_MAX];
+        snprintf(filepath, sizeof(filepath), "%s/%s.log", LOG_DIR, item.container_id);
+        
+        /* Open in append mode so we don't overwrite previous lines */
+        FILE *f = fopen(filepath, "a");
+        if (f) {
+            fwrite(item.data, 1, item.length, f);
+            fclose(f);
+        }
+    }
+    
     return NULL;
 }
 
@@ -429,6 +488,37 @@ int unregister_from_monitor(int monitor_fd, const char *container_id, pid_t host
     return 0;
 }
 
+/* Arguments passed to the producer thread */
+typedef struct {
+    int read_fd;
+    char container_id[CONTAINER_ID_LEN];
+    supervisor_ctx_t *ctx;
+} producer_args_t;
+
+void *producer_thread(void *arg)
+{
+    producer_args_t *pargs = (producer_args_t *)arg;
+    log_item_t item;
+    ssize_t bytes_read;
+
+    memset(&item, 0, sizeof(item));
+    strncpy(item.container_id, pargs->container_id, sizeof(item.container_id) - 1);
+
+    /* Read from the pipe until the container closes it (exits) */
+    while ((bytes_read = read(pargs->read_fd, item.data, LOG_CHUNK_SIZE)) > 0) {
+        item.length = bytes_read;
+        
+        /* Push to the bounded buffer. Blocks if full. */
+        if (bounded_buffer_push(&pargs->ctx->log_buffer, &item) != 0) {
+            break; /* Bail out if the supervisor is shutting down */
+        }
+    }
+
+    close(pargs->read_fd);
+    free(pargs);
+    return NULL;
+}
+
 /*
  * TODO:
  * Implement the long-running supervisor process.
@@ -486,6 +576,12 @@ static int run_supervisor(const char *rootfs)
     
     listen(ctx.server_fd, 5);
     printf("[Supervisor] Listening on %s\n", CONTROL_PATH);
+    
+    /* Start the logging consumer thread */
+    if (pthread_create(&ctx.logger_thread, NULL, logging_thread, &ctx) != 0) {
+        perror("Failed to start logger thread");
+        return 1;
+    }
 
     /* 3. The Supervisor Event Loop */
     while (!ctx.should_stop) {
@@ -497,15 +593,36 @@ static int run_supervisor(const char *rootfs)
             control_response_t resp;
             memset(&resp, 0, sizeof(resp));
 
-            if (req.kind == CMD_START) {
+        if (req.kind == CMD_START) {
                 child_config_t config;
                 memset(&config, 0, sizeof(config));
                 strncpy(config.id, req.container_id, CONTAINER_ID_LEN - 1);
                 strncpy(config.rootfs, req.rootfs, PATH_MAX - 1);
                 strncpy(config.command, req.command, CHILD_COMMAND_LEN - 1);
                 
+                /* Create the pipe for this container's stdout/stderr */
+                int log_pipe[2];
+                if (pipe(log_pipe) != 0) {
+                    perror("pipe failed");
+                    continue;
+                }
+                config.log_write_fd = log_pipe[1]; /* Give write-end to container */
+
                 pid_t pid = launch_container(&config);
                 if (pid > 0) {
+                    /* Close the write-end in the supervisor, we only read */
+                    close(log_pipe[1]);
+
+                    /* Spin up the producer thread for this container */
+                    producer_args_t *pargs = malloc(sizeof(producer_args_t));
+                    pargs->read_fd = log_pipe[0];
+                    strncpy(pargs->container_id, config.id, CONTAINER_ID_LEN - 1);
+                    pargs->ctx = &ctx;
+
+                    pthread_t prod_tid;
+                    pthread_create(&prod_tid, NULL, producer_thread, pargs);
+                    pthread_detach(prod_tid); /* Auto-cleanup when thread finishes */
+
                     snprintf(resp.message, sizeof(resp.message), 
                              "SUCCESS: Container '%s' started with Host PID: %d\n", config.id, pid);
                 } else {
@@ -522,6 +639,7 @@ static int run_supervisor(const char *rootfs)
     }
 
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
+    pthread_join(ctx.logger_thread, NULL); /* Wait for consumer to finish */
     bounded_buffer_destroy(&ctx.log_buffer);
     pthread_mutex_destroy(&ctx.metadata_lock);
     unlink(CONTROL_PATH);
