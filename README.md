@@ -19,12 +19,12 @@
 
 ## Demo Screenshots
 1. **Multi-container supervision:** [Completed] - Shows multiple `sleep` processes running under the supervisor.
-2. **Metadata tracking:** [Pending]
+2. **Metadata tracking:** [Completed] - Output of the `ps` command showing tracked container metadata including PIDs and resource limits.
 3. **Bounded-buffer logging:** [Completed] - Evidence of container output captured into log files via the concurrent pipeline.
 4. **CLI and IPC:** [Completed] - Shows successful "start" commands issued via CLI to the supervisor daemon.
-5. **Soft-limit warning:** [Pending]
-6. **Hard-limit enforcement:** [Pending]
-7. **Scheduling experiment:** [Pending]
+5. **Soft-limit warning:** [Completed] - `dmesg` output showing a soft-limit warning event when the `mem_hog` container crossed 2 MiB RSS.
+6. **Hard-limit enforcement:** [Completed] - `dmesg` output showing the `mem_hog` container being killed via `SIGKILL` after exceeding its 10 MiB hard limit.
+7. **Scheduling experiment:** [Completed] - Terminal output showing concurrent execution of `cpu_hog` (nice 10) and `io_pulse` (nice 0).
 8. **Clean teardown:** [Pending]
 
 ## Engineering Analysis
@@ -45,7 +45,15 @@
     - **`pthread_cond_t`:** Used `not_full` and `not_empty` signals to prevent busy-waiting. This avoids deadlocks by putting threads to sleep when the buffer is full (producers) or empty (consumer).
 
 ### 4. Memory Management (Kernel Module)
-### 5. Scheduling Experiments
+- **RSS (Resident Set Size):** Measures the physical RAM currently held by the process. It is a critical metric for enforcement because it represents the actual pressure the container puts on the host's memory subsystem.
+- **Kernel Enforcement:** Enforcement belongs in kernel space because it must be performed in an atomic, high-priority context (timer interrupt) that cannot be bypassed or delayed by user-space process scheduling.
+- **Policy Differences:** - **Soft Limit:** Triggers a telemetry warning to signal that a container is exceeding its expected baseline.
+    - **Hard Limit:** Triggers immediate termination via `SIGKILL` to prevent a rogue container from causing a system-wide Out-of-Memory (OOM) panic.
+
+### 5. Scheduling Behavior
+- **Scheduler Dynamics:** The Linux Completely Fair Scheduler (CFS) balances CPU time across processes. 
+- **I/O-Bound vs CPU-Bound:** The `io_pulse` workload frequently yields the CPU while waiting for write operations to complete. The scheduler rewards this behavior with lower-latency wakeups to maintain responsiveness. Conversely, `cpu_hog` consumes its entire timeslice.
+- **Priority Adjustment:** Applying `--nice 10` to `cpu_hog` lowered its scheduling weight, ensuring the CPU-bound task did not starve the I/O-bound process or the supervisor daemon.
 
 ## Design Decisions and Tradeoffs
 - **Namespace Selection:** Chose `clone()` flags for isolation. 
@@ -56,4 +64,9 @@
     - **Justification:** Prevents the supervisor from consuming excessive memory under heavy load.
 
 ## Scheduler Experiment Results
-*(To be populated in final phase)*
+**Experiment Setup:**
+- Workload A: `cpu_hog` (CPU-bound) running with `--nice 10` priority.
+- Workload B: `io_pulse` (I/O-bound) running with default priority.
+
+**Observations:**
+Both containers executed concurrently. `io_pulse` immediately began iterating through its write loops, demonstrating rapid scheduler attention. `cpu_hog` processed calculations in the background, but its reduced priority ensured it gracefully yielded resources to the I/O operations and the supervisor's IPC handlers.
