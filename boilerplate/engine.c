@@ -685,6 +685,30 @@ static int run_supervisor(const char *rootfs)
                     curr = curr->next;
                 }
                 pthread_mutex_unlock(&ctx.metadata_lock);
+            } else if (req.kind == CMD_STOP) {
+                /* Lock metadata and search for the running container */
+                pthread_mutex_lock(&ctx.metadata_lock);
+                container_record_t *curr = ctx.containers;
+                int found = 0;
+                
+                while (curr) {
+                    if (strcmp(curr->id, req.container_id) == 0 && curr->state == CONTAINER_RUNNING) {
+                        /* Mark state and kill process per project requirements */
+                        curr->state = CONTAINER_STOPPED;
+                        kill(curr->host_pid, SIGKILL);
+                        found = 1;
+                        snprintf(resp.message, sizeof(resp.message), 
+                                 "SUCCESS: Stopped container '%s'\n", req.container_id);
+                        break;
+                    }
+                    curr = curr->next;
+                }
+                
+                if (!found) {
+                    snprintf(resp.message, sizeof(resp.message), 
+                             "ERROR: Container '%s' not found or not running.\n", req.container_id);
+                }
+                pthread_mutex_unlock(&ctx.metadata_lock);
             } else {
                 /* Fallback for other commands not yet built (STOP, LOGS, etc.) */
                 snprintf(resp.message, sizeof(resp.message), 
