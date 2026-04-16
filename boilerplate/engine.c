@@ -338,8 +338,61 @@ void *logging_thread(void *arg)
  */
 int child_fn(void *arg)
 {
-    (void)arg;
+    child_config_t *config = (child_config_t *)arg;
+
+    /* 1. Isolate the hostname (UTS Namespace) */
+    sethostname(config->id, strlen(config->id));
+
+    /* 2. Isolate the filesystem (Mount Namespace) */
+    if (chroot(config->rootfs) != 0 || chdir("/") != 0) {
+        perror("chroot/chdir failed");
+        return 1;
+    }
+
+    /* 3. Mount /proc so tools like 'ps' work inside the container */
+    if (mount("proc", "/proc", "proc", 0, NULL) != 0) {
+        perror("mount /proc failed");
+        return 1;
+    }
+
+    /* 4. Redirect stdout/stderr to the supervisor's logging pipe */
+    if (config->log_write_fd > 0) {
+        dup2(config->log_write_fd, STDOUT_FILENO);
+        dup2(config->log_write_fd, STDERR_FILENO);
+        close(config->log_write_fd);
+    }
+
+    /* 5. Execute the requested command */
+    char *argv[] = { "/bin/sh", "-c", config->command, NULL };
+    execv(argv[0], argv);
+
+    /* If execv returns, it failed */
+    perror("execv failed");
     return 1;
+}
+
+static pid_t launch_container(child_config_t *config)
+{
+    void *stack = malloc(STACK_SIZE);
+    if (!stack) {
+        perror("malloc stack failed");
+        return -1;
+    }
+
+    /* clone() needs the top of the stack because it grows downward */
+    void *stack_top = stack + STACK_SIZE;
+
+    /* Flags for isolation: PID, UTS (hostname), and Mount namespaces */
+    int flags = CLONE_NEWPID | CLONE_NEWUTS | CLONE_NEWNS | SIGCHLD;
+    
+    pid_t pid = clone(child_fn, stack_top, flags, config);
+    if (pid == -1) {
+        perror("clone failed");
+        free(stack);
+        return -1;
+    }
+
+    return pid;
 }
 
 int register_with_monitor(int monitor_fd,
@@ -411,20 +464,68 @@ static int run_supervisor(const char *rootfs)
         return 1;
     }
 
-    /*
-     * TODO:
-     *   1) open /dev/container_monitor
-     *   2) create the control socket / FIFO / shared-memory channel
-     *   3) install SIGCHLD / SIGINT / SIGTERM handling
-     *   4) spawn the logger thread
-     *   5) enter the supervisor event loop
-     */
-    fprintf(stderr, "Supervisor mode not implemented yet for base-rootfs: %s\n", rootfs);
+    /* 1. Remove any stale socket file */
+    unlink(CONTROL_PATH);
+    
+    /* 2. Create and bind the UNIX domain socket */
+    ctx.server_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (ctx.server_fd < 0) {
+        perror("socket failed");
+        return 1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path) - 1);
+
+    if (bind(ctx.server_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind failed");
+        return 1;
+    }
+    
+    listen(ctx.server_fd, 5);
+    printf("[Supervisor] Listening on %s\n", CONTROL_PATH);
+
+    /* 3. The Supervisor Event Loop */
+    while (!ctx.should_stop) {
+        int client_fd = accept(ctx.server_fd, NULL, NULL);
+        if (client_fd < 0) continue;
+
+        control_request_t req;
+        if (read(client_fd, &req, sizeof(req)) == sizeof(req)) {
+            control_response_t resp;
+            memset(&resp, 0, sizeof(resp));
+
+            if (req.kind == CMD_START) {
+                child_config_t config;
+                memset(&config, 0, sizeof(config));
+                strncpy(config.id, req.container_id, CONTAINER_ID_LEN - 1);
+                strncpy(config.rootfs, req.rootfs, PATH_MAX - 1);
+                strncpy(config.command, req.command, CHILD_COMMAND_LEN - 1);
+                
+                pid_t pid = launch_container(&config);
+                if (pid > 0) {
+                    snprintf(resp.message, sizeof(resp.message), 
+                             "SUCCESS: Container '%s' started with Host PID: %d\n", config.id, pid);
+                } else {
+                    snprintf(resp.message, sizeof(resp.message), 
+                             "ERROR: Failed to start container '%s'\n", config.id);
+                }
+            } else {
+                snprintf(resp.message, sizeof(resp.message), 
+                         "Command received but not fully implemented yet.\n");
+            }
+            write(client_fd, &resp, sizeof(resp));
+        }
+        close(client_fd);
+    }
 
     bounded_buffer_begin_shutdown(&ctx.log_buffer);
     bounded_buffer_destroy(&ctx.log_buffer);
     pthread_mutex_destroy(&ctx.metadata_lock);
-    return 1;
+    unlink(CONTROL_PATH);
+    return 0;
 }
 
 /*
@@ -437,9 +538,37 @@ static int run_supervisor(const char *rootfs)
  */
 static int send_control_request(const control_request_t *req)
 {
-    (void)req;
-    fprintf(stderr, "Control-plane client path not implemented.\n");
-    return 1;
+    int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("socket creation failed");
+        return 1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, CONTROL_PATH, sizeof(addr.sun_path) - 1);
+
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        fprintf(stderr, "Failed to connect to supervisor at %s. Is it running?\n", CONTROL_PATH);
+        close(sock);
+        return 1;
+    }
+
+    if (write(sock, req, sizeof(*req)) != sizeof(*req)) {
+        perror("Failed to send request to supervisor");
+        close(sock);
+        return 1;
+    }
+
+    control_response_t resp;
+    int bytes_read = read(sock, &resp, sizeof(resp));
+    if (bytes_read > 0) {
+        printf("%s", resp.message);
+    }
+
+    close(sock);
+    return 0;
 }
 
 static int cmd_start(int argc, char *argv[])
