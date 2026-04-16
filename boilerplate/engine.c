@@ -553,6 +553,12 @@ static int run_supervisor(const char *rootfs)
         pthread_mutex_destroy(&ctx.metadata_lock);
         return 1;
     }
+    
+    /* Open the kernel monitor device */
+    ctx.monitor_fd = open("/dev/container_monitor", O_RDWR);
+    if (ctx.monitor_fd < 0) {
+        perror("Warning: Could not open /dev/container_monitor. Memory limits won't be enforced.");
+    }
 
     /* 1. Remove any stale socket file */
     unlink(CONTROL_PATH);
@@ -610,10 +616,16 @@ static int run_supervisor(const char *rootfs)
 
                 pid_t pid = launch_container(&config);
                 if (pid > 0) {
-                    /* Close the write-end in the supervisor, we only read */
+                    /* 1. Register with kernel monitor if device is open */
+                    if (ctx.monitor_fd >= 0) {
+                        register_with_monitor(ctx.monitor_fd, config.id, pid, 
+                                            req.soft_limit_bytes, req.hard_limit_bytes);
+                    }
+                    
+                    /* 2. Close the write-end in the supervisor, we only read */
                     close(log_pipe[1]);
 
-                    /* Spin up the producer thread for this container */
+                    /* 3. Spin up the producer thread for this container */
                     producer_args_t *pargs = malloc(sizeof(producer_args_t));
                     pargs->read_fd = log_pipe[0];
                     strncpy(pargs->container_id, config.id, CONTAINER_ID_LEN - 1);
@@ -622,6 +634,23 @@ static int run_supervisor(const char *rootfs)
                     pthread_t prod_tid;
                     pthread_create(&prod_tid, NULL, producer_thread, pargs);
                     pthread_detach(prod_tid); /* Auto-cleanup when thread finishes */
+                    
+                    /* 4. Record container metadata */
+                    container_record_t *rec = malloc(sizeof(container_record_t));
+                    memset(rec, 0, sizeof(*rec));
+                    strncpy(rec->id, config.id, CONTAINER_ID_LEN - 1);
+                    rec->host_pid = pid;
+                    rec->started_at = time(NULL);
+                    rec->state = CONTAINER_RUNNING;
+                    rec->soft_limit_bytes = req.soft_limit_bytes;
+                    rec->hard_limit_bytes = req.hard_limit_bytes;
+                    snprintf(rec->log_path, PATH_MAX, "%s/%s.log", LOG_DIR, config.id);
+                    
+                    /* Safely add to the global list */
+                    pthread_mutex_lock(&ctx.metadata_lock);
+                    rec->next = ctx.containers;
+                    ctx.containers = rec;
+                    pthread_mutex_unlock(&ctx.metadata_lock);
 
                     snprintf(resp.message, sizeof(resp.message), 
                              "SUCCESS: Container '%s' started with Host PID: %d\n", config.id, pid);
@@ -629,10 +658,39 @@ static int run_supervisor(const char *rootfs)
                     snprintf(resp.message, sizeof(resp.message), 
                              "ERROR: Failed to start container '%s'\n", config.id);
                 }
+            } else if (req.kind == CMD_PS) {
+                /* Lock metadata so we can safely read the linked list */
+                pthread_mutex_lock(&ctx.metadata_lock);
+                container_record_t *curr = ctx.containers;
+                int offset = 0;
+                
+                /* 1. Add the table header to the message buffer */
+                offset += snprintf(resp.message + offset, sizeof(resp.message) - offset, 
+                                   "%-15s %-10s %-10s %-10s %-10s\n", 
+                                   "CONTAINER ID", "PID", "STATE", "SOFT(MB)", "HARD(MB)");
+                offset += snprintf(resp.message + offset, sizeof(resp.message) - offset, 
+                                   "--------------------------------------------------------------\n");
+                
+                if (!curr) {
+                    snprintf(resp.message + offset, sizeof(resp.message) - offset, "No containers running.\n");
+                }
+                
+                /* 2. Iterate through each container in the linked list */
+                while (curr && offset < sizeof(resp.message) - 1) {
+                    offset += snprintf(resp.message + offset, sizeof(resp.message) - offset, 
+                                       "%-15s %-10d %-10s %-10lu %-10lu\n", 
+                                       curr->id, curr->host_pid, state_to_string(curr->state), 
+                                       curr->soft_limit_bytes / (1024 * 1024), 
+                                       curr->hard_limit_bytes / (1024 * 1024));
+                    curr = curr->next;
+                }
+                pthread_mutex_unlock(&ctx.metadata_lock);
             } else {
+                /* Fallback for other commands not yet built (STOP, LOGS, etc.) */
                 snprintf(resp.message, sizeof(resp.message), 
                          "Command received but not fully implemented yet.\n");
             }
+            /* Send the completed table (or error message) back to the CLI client */
             write(client_fd, &resp, sizeof(resp));
         }
         close(client_fd);
@@ -642,6 +700,8 @@ static int run_supervisor(const char *rootfs)
     pthread_join(ctx.logger_thread, NULL); /* Wait for consumer to finish */
     bounded_buffer_destroy(&ctx.log_buffer);
     pthread_mutex_destroy(&ctx.metadata_lock);
+    unlink(CONTROL_PATH);
+    if (ctx.monitor_fd >= 0) close(ctx.monitor_fd);
     unlink(CONTROL_PATH);
     return 0;
 }
