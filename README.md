@@ -1,12 +1,13 @@
 # OS-Jackfruit: Custom Linux Container Runtime
 
 **Team Members:**
-* Shobhit Rachit Keshri (GitHub: kesho475)
+* Shobhit Rachit Keshri (SRN: PES2UG24CS475 ; GitHub: kesho475)
+  
 
 ## Build, Load, and Run Instructions
 
 ### Environment Setup
-- **Host OS:** Ubuntu 24.04 (Bare Metal Boot)
+- **Host OS:** Ubuntu 22.04 (Bare Metal Boot)
 - **Kernel Version:** 6.17+
 - **Root Filesystem:** Alpine Linux Mini-Rootfs (v3.20.3)
 
@@ -15,7 +16,91 @@
 2. Updated `monitor.c` (`timer_delete_sync`) to ensure compatibility with modern Linux kernels (6.15+).
 3. Downloaded and extracted the Alpine mini-rootfs into the `rootfs-base/` directory to serve as the isolated filesystem template.
 
-*(Further build and run commands will be added as features are implemented.)*
+### Execution Guide
+
+To reproduce the project demonstration, open two terminal windows (one for the long-running daemon, and one for the CLI client) and execute the following sequence.
+
+#### 0. Pre-Run Clean
+Ensure a pristine environment by clearing any stale processes, kernel modules, log files, or mounts.
+
+**Terminal 2**
+```bash
+sudo killall sleep cpu_hog io_pulse mem_hog 2>/dev/null
+sudo killall engine 2>/dev/null
+sudo rmmod monitor 2>/dev/null
+sudo umount ~/OS-Jackfruit/rootfs-*/proc 2>/dev/null
+sudo rm -rf ~/OS-Jackfruit/logs/*
+```
+
+#### 1. Setup and Initialization
+Compile the user-space binaries, load the kernel monitor, and start the supervisor daemon.
+
+**Terminal 1 (Supervisor)**
+```bash
+cd ~/OS-Jackfruit/boilerplate
+make
+cd ~/OS-Jackfruit
+sudo insmod boilerplate/monitor.ko
+sudo ./boilerplate/engine supervisor ./rootfs-base
+```
+*(Leave Terminal 1 running in the background)*
+
+#### 2. Multi-Container Supervision
+Launch multiple isolated background containers and verify their tracking metadata.
+
+**Terminal 2 (Client)**
+```bash
+cd ~/OS-Jackfruit
+sudo ./boilerplate/engine start alpha ./rootfs-alpha "sleep 100"
+sudo ./boilerplate/engine start beta ./rootfs-beta "sleep 100"
+sudo ./boilerplate/engine ps
+```
+
+#### 3. Memory Enforcement
+Demonstrate the kernel monitor's ability to enforce soft and hard Resident Set Size (RSS) limits.
+
+**Terminal 2 (Client)**
+```bash
+sudo ./boilerplate/engine stop alpha
+sudo ./boilerplate/engine start memtest ./rootfs-alpha "/mem_hog" --soft-mib 2 --hard-mib 10
+sleep 15
+sudo dmesg | tail -n 10
+```
+
+#### 4. Scheduling & Bounded-Buffer Logging
+Run concurrent CPU and I/O workloads with adjusted priorities and verify the log-capture pipeline.
+
+**Terminal 2 (Client)**
+```bash
+sudo ./boilerplate/engine stop memtest
+sudo ./boilerplate/engine stop beta
+sudo ./boilerplate/engine start hog ./rootfs-alpha "/cpu_hog" --nice 10
+sudo ./boilerplate/engine start pulse ./rootfs-beta "/io_pulse"
+sleep 5
+sudo ./boilerplate/engine ps
+cat logs/hog.log
+cat logs/pulse.log
+```
+
+#### 5. Clean Teardown
+Prove that all system resources, namespaces, and kernel allocations are cleanly released.
+
+**Terminal 2 (Client)**
+```bash
+sudo ./boilerplate/engine stop hog
+sudo ./boilerplate/engine stop pulse
+```
+
+**Terminal 1 (Supervisor)**
+Press `Ctrl+C` to gracefully shut down the supervisor daemon.
+
+**Terminal 2 (Client)**
+```bash
+sudo rmmod monitor
+sudo dmesg | tail -n 5
+ps aux | grep engine
+sudo umount ~/OS-Jackfruit/rootfs-*/proc
+```
 
 ## Demo Screenshots
 1. **Multi-container supervision:** [Completed] - Shows multiple `sleep` processes running under the supervisor.
@@ -25,7 +110,7 @@
 5. **Soft-limit warning:** [Completed] - `dmesg` output showing a soft-limit warning event when the `mem_hog` container crossed 2 MiB RSS.
 6. **Hard-limit enforcement:** [Completed] - `dmesg` output showing the `mem_hog` container being killed via `SIGKILL` after exceeding its 10 MiB hard limit.
 7. **Scheduling experiment:** [Completed] - Terminal output showing concurrent execution of `cpu_hog` (nice 10) and `io_pulse` (nice 0).
-8. **Clean teardown:** [Pending]
+8. **Clean teardown:** [Completed] - Terminal output showing the successful `rmmod` command, `dmesg` unload confirmation, and clean `ps` process tree.
 
 ## Engineering Analysis
 
@@ -35,7 +120,7 @@
 - **Kernel-level Sharing:** While namespaces isolate resource visibility, the containers still share the host's underlying Linux kernel and hardware resources.
 
 ### 2. Supervisor Lifecycle
-- **Parent-Child Relationships:** The long-running supervisor act as the reaper for container processes, ensuring that `SIGCHLD` signals are handled to prevent the accumulation of zombie processes.
+- **Parent-Child Relationships:** The long-running supervisor acts as the reaper for container processes, ensuring that `SIGCHLD` signals are handled to prevent the accumulation of zombie processes.
 - **Control Plane IPC:** A UNIX domain socket at `/tmp/mini_runtime.sock` allows the CLI client to send requests to the supervisor, enabling management of multiple concurrent container lifecycles.
 
 ### 3. IPC & Synchronization
