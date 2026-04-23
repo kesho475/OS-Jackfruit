@@ -1,13 +1,12 @@
 # OS-Jackfruit: Custom Linux Container Runtime
 
-**Team Members:**
-* Shobhit Rachit Keshri (SRN: PES2UG24CS475 ; GitHub: kesho475)
-  
+**Done By:**
+* Shobhit Rachit keshri (SRN: PES2UG24CS475 ; GitHub: kesho475)
 
 ## Build, Load, and Run Instructions
 
 ### Environment Setup
-- **Host OS:** Ubuntu 22.04 (Bare Metal Boot)
+- **Host OS:** Ubuntu 24.04 (Bare Metal Boot)
 - **Kernel Version:** 6.17+
 - **Root Filesystem:** Alpine Linux Mini-Rootfs (v3.20.3)
 
@@ -18,34 +17,58 @@
 
 ### Execution Guide
 
-To reproduce the project demonstration, open two terminal windows (one for the long-running daemon, and one for the CLI client) and execute the following sequence.
+To reproduce the project demonstration from a fresh `git clone`, open two terminal windows (one for the long-running daemon, and one for the CLI client) and execute the following sequence.
 
-#### 0. Pre-Run Clean
+#### 0. Pre-Run Clean (For Repeated Runs)
 Ensure a pristine environment by clearing any stale processes, kernel modules, log files, or mounts.
 
 **Terminal 2**
 ```bash
-sudo killall sleep cpu_hog io_pulse mem_hog 2>/dev/null
+sudo killall sleep cpu_hog io_pulse memory_hog 2>/dev/null
 sudo killall engine 2>/dev/null
 sudo rmmod monitor 2>/dev/null
 sudo umount ~/OS-Jackfruit/rootfs-*/proc 2>/dev/null
 sudo rm -rf ~/OS-Jackfruit/logs/*
 ```
 
-#### 1. Setup and Initialization
-Compile the user-space binaries, load the kernel monitor, and start the supervisor daemon.
+#### 1. Build Binaries & Prepare Filesystems
+Because Git does not track empty folders (like `logs/`) and the Alpine rootfs files are not kept in version control, you must compile the project and generate the isolated directories first.
 
 **Terminal 1 (Supervisor)**
 ```bash
+# Compile user-space engine, workloads, and kernel module
 cd ~/OS-Jackfruit/boilerplate
 make
 cd ~/OS-Jackfruit
+
+# Create crucial directories
+mkdir -p logs
+mkdir -p rootfs-base
+
+# Download and extract the base Alpine filesystem
+wget -qO- https://dl-cdn.alpinelinux.org/alpine/v3.20/releases/x86_64/alpine-minirootfs-3.20.3-x86_64.tar.gz | tar -xz -C rootfs-base
+
+# Create unique writable rootfs copies for the containers
+cp -a ./rootfs-base ./rootfs-alpha
+cp -a ./rootfs-base ./rootfs-beta
+
+# Copy the compiled test workloads into the isolated jails
+cp boilerplate/memory_hog rootfs-alpha/
+cp boilerplate/cpu_hog rootfs-alpha/
+cp boilerplate/io_pulse rootfs-beta/
+```
+
+#### 2. Start the Kernel Monitor & Supervisor
+Load the custom memory enforcement module and boot the daemon.
+
+**Terminal 1 (Supervisor)**
+```bash
 sudo insmod boilerplate/monitor.ko
 sudo ./boilerplate/engine supervisor ./rootfs-base
 ```
-*(Leave Terminal 1 running in the background)*
+*(Leave Terminal 1 running in the background to manage container lifecycles)*
 
-#### 2. Multi-Container Supervision
+#### 3. Multi-Container Supervision
 Launch multiple isolated background containers and verify their tracking metadata.
 
 **Terminal 2 (Client)**
@@ -56,19 +79,29 @@ sudo ./boilerplate/engine start beta ./rootfs-beta "sleep 100"
 sudo ./boilerplate/engine ps
 ```
 
-#### 3. Memory Enforcement
-Demonstrate the kernel monitor's ability to enforce soft and hard Resident Set Size (RSS) limits.
+#### 4. Bounded-Buffer Logging
+Verify that container standard output is correctly captured by the concurrent logging pipeline.
 
 **Terminal 2 (Client)**
 ```bash
 sudo ./boilerplate/engine stop alpha
-sudo ./boilerplate/engine start memtest ./rootfs-alpha "/mem_hog" --soft-mib 2 --hard-mib 10
-sleep 15
-sudo dmesg | tail -n 10
+sudo ./boilerplate/engine start alpha ./rootfs-alpha "echo 'I am testing out this isolated container for my OS Jackfruit'"
+sleep 2
+cat logs/alpha.log
 ```
 
-#### 4. Scheduling & Bounded-Buffer Logging
-Run concurrent CPU and I/O workloads with adjusted priorities and verify the log-capture pipeline.
+#### 5. Memory Enforcement
+Demonstrate the kernel monitor's ability to enforce soft and hard Resident Set Size (RSS) limits.
+
+**Terminal 2 (Client)**
+```bash
+sudo ./boilerplate/engine start memtest ./rootfs-alpha "/memory_hog" --soft-mib 2 --hard-mib 10
+sleep 15
+sudo dmesg | grep container_monitor | tail -n 10
+```
+
+#### 6. Scheduling Priorities
+Run concurrent CPU and I/O workloads with adjusted priorities to observe the CFS scheduler.
 
 **Terminal 2 (Client)**
 ```bash
@@ -82,7 +115,7 @@ cat logs/hog.log
 cat logs/pulse.log
 ```
 
-#### 5. Clean Teardown
+#### 7. Clean Teardown
 Prove that all system resources, namespaces, and kernel allocations are cleanly released.
 
 **Terminal 2 (Client)**
@@ -99,7 +132,7 @@ Press `Ctrl+C` to gracefully shut down the supervisor daemon.
 sudo rmmod monitor
 sudo dmesg | tail -n 5
 ps aux | grep engine
-sudo umount ~/OS-Jackfruit/rootfs-*/proc
+sudo umount ~/OS-Jackfruit/rootfs-*/proc 2>/dev/null
 ```
 
 ## Demo Screenshots
@@ -107,8 +140,8 @@ sudo umount ~/OS-Jackfruit/rootfs-*/proc
 2. **Metadata tracking:** [Completed] - Output of the `ps` command showing tracked container metadata including PIDs and resource limits.
 3. **Bounded-buffer logging:** [Completed] - Evidence of container output captured into log files via the concurrent pipeline.
 4. **CLI and IPC:** [Completed] - Shows successful "start" commands issued via CLI to the supervisor daemon.
-5. **Soft-limit warning:** [Completed] - `dmesg` output showing a soft-limit warning event when the `mem_hog` container crossed 2 MiB RSS.
-6. **Hard-limit enforcement:** [Completed] - `dmesg` output showing the `mem_hog` container being killed via `SIGKILL` after exceeding its 10 MiB hard limit.
+5. **Soft-limit warning:** [Completed] - `dmesg` output showing a soft-limit warning event when the `memory_hog` container crossed 2 MiB RSS.
+6. **Hard-limit enforcement:** [Completed] - `dmesg` output showing the `memory_hog` container being killed via `SIGKILL` after exceeding its 10 MiB hard limit.
 7. **Scheduling experiment:** [Completed] - Terminal output showing concurrent execution of `cpu_hog` (nice 10) and `io_pulse` (nice 0).
 8. **Clean teardown:** [Completed] - Terminal output showing the successful `rmmod` command, `dmesg` unload confirmation, and clean `ps` process tree.
 
